@@ -1,0 +1,21 @@
+# Python artifacts
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+
+# Virtualenvs
+.env/
+venv/
+env/
+
+# Local configuration/secrets
+.env
+sent_urls.txt
+sent_news.txt
+*.log
+
+# OS files
+.DS_Store
+Thumbs.db
