@@ -28,6 +28,7 @@ SITEMAP_LIST_URL = os.getenv("SITEMAP_LIST_URL")  # harici sitemap listesi (satÄ
 SITEMAP_CHECK_SECONDS = int(os.getenv("SITEMAP_CHECK_SECONDS", "600"))  # 10 minutes
 SITEMAP_REFRESH_SECONDS = int(os.getenv("SITEMAP_REFRESH_SECONDS", "86400"))  # 24 hours
 NEWS_SENT_FILE = os.getenv("NEWS_SENT_FILE", "sent_news.txt")
+NEWS_LIMIT = int(os.getenv("NEWS_LIMIT", "10"))
 
 API_URL = "https://api.twitterapi.io/twitter/tweet/advanced_search"
 TELEGRAM_SEND_URL = (
@@ -254,6 +255,9 @@ def main() -> None:
                     if url in sent_news:
                         continue
                     new_links.append(url)
+
+                if NEWS_LIMIT > 0 and len(new_links) > NEWS_LIMIT:
+                    new_links = new_links[-NEWS_LIMIT:]
 
                 if new_links:
                     print(

@@ -20,6 +20,7 @@
    TELEGRAM_CHAT_ID=7561796744
    # SENT_URLS_FILE=sent_urls.txt      # gönderilen tweet URL’leri
    # NEWS_SENT_FILE=sent_news.txt      # gönderilen haber URL’leri
+   # NEWS_LIMIT=10                     # her sitemap taramasında en fazla bu kadar yeni link
    # SITEMAP_LIST_URL=https://example.com/path/to/sitemap_list.txt   # tercih edilen yöntem
    # SITEMAP_LIST_FILE=sitemap.txt     # (opsiyonel) yerel dosya, repo dışı tutun
    # SITEMAP_CHECK_SECONDS=600         # sitemap tarama sıklığı (varsayılan 10 dk)
