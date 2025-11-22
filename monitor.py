@@ -2,8 +2,12 @@ import os
 import sys
 import time
 from datetime import datetime
+from typing import Optional
 
+import boto3
 import requests
+from botocore.config import Config as BotoConfig
+from botocore.exceptions import ClientError
 from dotenv import load_dotenv
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
@@ -12,28 +16,47 @@ from xml.etree import ElementTree
 # Load environment variables from a local .env file if it exists.
 load_dotenv()
 
+# Tweet search settings
 API_KEY = os.getenv("API_KEY") or os.getenv("X_API_KEY")
 QUERY = os.getenv("QUERY", "Kırklareli")
 QUERY_TYPE = os.getenv("QUERY_TYPE", "Latest")
 TWEET_LIMIT = int(os.getenv("TWEET_LIMIT", "10"))
-TWEET_POLL_INTERVAL = int(os.getenv("POLL_INTERVAL_SECONDS", "300"))  # 5 minutes default
+TWEET_POLL_INTERVAL = int(os.getenv("POLL_INTERVAL_SECONDS", "300"))  # seconds
+
+# Telegram
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-SENT_URLS_FILE = os.getenv("SENT_URLS_FILE", "sent_urls.txt")
-HTTP_TIMEOUT = float(os.getenv("HTTP_TIMEOUT_SECONDS", "30"))
-HTTP_MAX_RETRIES = int(os.getenv("HTTP_MAX_RETRIES", "3"))
-HTTP_RETRY_BACKOFF = float(os.getenv("HTTP_RETRY_BACKOFF", "2"))
-SITEMAP_LIST_FILE = os.getenv("SITEMAP_LIST_FILE", "sitemap.txt")
-SITEMAP_LIST_URL = os.getenv("SITEMAP_LIST_URL")  # harici sitemap listesi (satır başına URL)
-SITEMAP_CHECK_SECONDS = int(os.getenv("SITEMAP_CHECK_SECONDS", "600"))  # 10 minutes
-SITEMAP_REFRESH_SECONDS = int(os.getenv("SITEMAP_REFRESH_SECONDS", "86400"))  # 24 hours
-NEWS_SENT_FILE = os.getenv("NEWS_SENT_FILE", "sent_news.txt")
-NEWS_LIMIT = int(os.getenv("NEWS_LIMIT", "10"))
-
-API_URL = "https://api.twitterapi.io/twitter/tweet/advanced_search"
 TELEGRAM_SEND_URL = (
     f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage" if TELEGRAM_TOKEN else None
 )
+
+# Local persistence files
+SENT_URLS_FILE = os.getenv("SENT_URLS_FILE", "sent_urls.txt")
+NEWS_SENT_FILE = os.getenv("NEWS_SENT_FILE", "sent_news.txt")
+NEWS_LIMIT = int(os.getenv("NEWS_LIMIT", "10"))
+
+# S3 persistence (Cloudflare R2 or any S3-compatible)
+S3_ENABLE = os.getenv("S3_ENABLE", "false").lower() == "true"
+S3_ENDPOINT = os.getenv("S3_ENDPOINT")
+S3_ACCESS_KEY = os.getenv("S3_ACCESS_KEY")
+S3_SECRET_KEY = os.getenv("S3_SECRET_KEY")
+S3_REGION = os.getenv("S3_REGION", "auto")
+S3_BUCKET = os.getenv("S3_BUCKET")
+S3_SENT_URLS_KEY = os.getenv("S3_SENT_URLS_KEY", "sent_urls.txt")
+S3_SENT_NEWS_KEY = os.getenv("S3_SENT_NEWS_KEY", "sent_news.txt")
+
+# HTTP settings
+HTTP_TIMEOUT = float(os.getenv("HTTP_TIMEOUT_SECONDS", "30"))
+HTTP_MAX_RETRIES = int(os.getenv("HTTP_MAX_RETRIES", "3"))
+HTTP_RETRY_BACKOFF = float(os.getenv("HTTP_RETRY_BACKOFF", "2"))
+
+# Sitemap settings
+SITEMAP_LIST_URL = os.getenv("SITEMAP_LIST_URL")
+SITEMAP_LIST_FILE = os.getenv("SITEMAP_LIST_FILE", "sitemap.txt")
+SITEMAP_CHECK_SECONDS = int(os.getenv("SITEMAP_CHECK_SECONDS", "600"))  # seconds
+SITEMAP_REFRESH_SECONDS = int(os.getenv("SITEMAP_REFRESH_SECONDS", "86400"))  # seconds
+
+API_URL = "https://api.twitterapi.io/twitter/tweet/advanced_search"
 
 
 def ensure_api_key() -> None:
@@ -58,6 +81,34 @@ def create_session() -> requests.Session:
     return session
 
 
+def create_s3_client() -> Optional[object]:
+    """Create an S3-compatible client if credentials are provided."""
+    if not S3_ENABLE:
+        return None
+    missing = [name for name, val in [
+        ("S3_ENDPOINT", S3_ENDPOINT),
+        ("S3_ACCESS_KEY", S3_ACCESS_KEY),
+        ("S3_SECRET_KEY", S3_SECRET_KEY),
+        ("S3_BUCKET", S3_BUCKET),
+    ] if not val]
+    if missing:
+        print(f"{datetime.now().isoformat(timespec='seconds')} S3 disabled: missing {missing}")
+        return None
+    try:
+        client = boto3.client(
+            "s3",
+            endpoint_url=S3_ENDPOINT,
+            aws_access_key_id=S3_ACCESS_KEY,
+            aws_secret_access_key=S3_SECRET_KEY,
+            region_name=S3_REGION,
+            config=BotoConfig(signature_version="s3v4"),
+        )
+        return client
+    except Exception as err:
+        print(f"{datetime.now().isoformat(timespec='seconds')} S3 client init failed: {err}")
+        return None
+
+
 def fetch_latest_tweets() -> list[dict]:
     """Run advanced search for the configured query."""
     headers = {"x-api-key": API_KEY}
@@ -69,8 +120,48 @@ def fetch_latest_tweets() -> list[dict]:
     return payload.get("tweets", [])
 
 
+def fetch_s3_set(key: str) -> Optional[set[str]]:
+    """Fetch a set of URLs from S3; returns None on failure, empty set if missing."""
+    if not S3_CLIENT:
+        return None
+    try:
+        obj = S3_CLIENT.get_object(Bucket=S3_BUCKET, Key=key)
+        body = obj.get("Body").read().decode("utf-8")
+        return {line.strip() for line in body.splitlines() if line.strip()}
+    except ClientError as err:
+        code = err.response.get("Error", {}).get("Code")
+        if code in ("NoSuchKey", "NoSuchBucket"):
+            return set()
+        print(f"{datetime.now().isoformat(timespec='seconds')} S3 read error ({key}): {err}")
+        return None
+    except Exception as err:
+        print(f"{datetime.now().isoformat(timespec='seconds')} S3 read error ({key}): {err}")
+        return None
+
+
+def upload_s3_set(values: set[str], key: str) -> bool:
+    """Upload a set of URLs to S3; returns True on success."""
+    if not S3_CLIENT:
+        return False
+    try:
+        body = "\n".join(sorted(values)) + ("\n" if values else "")
+        S3_CLIENT.put_object(
+            Bucket=S3_BUCKET,
+            Key=key,
+            Body=body.encode("utf-8"),
+            ContentType="text/plain",
+        )
+        return True
+    except Exception as err:
+        print(f"{datetime.now().isoformat(timespec='seconds')} S3 write error ({key}): {err}")
+        return False
+
+
 def load_sent_urls() -> set[str]:
-    """Load previously sent tweet URLs from disk to avoid duplicate Telegram messages."""
+    """Load previously sent tweet URLs from remote S3 or local disk."""
+    remote = fetch_s3_set(S3_SENT_URLS_KEY) if S3_CLIENT else None
+    if remote is not None:
+        return remote
     if not os.path.exists(SENT_URLS_FILE):
         return set()
     with open(SENT_URLS_FILE, encoding="utf-8") as file:
@@ -78,13 +169,16 @@ def load_sent_urls() -> set[str]:
 
 
 def persist_sent_url(url: str) -> None:
-    """Append a sent tweet URL to disk."""
+    """Append a sent tweet URL to local disk."""
     with open(SENT_URLS_FILE, "a", encoding="utf-8") as file:
         file.write(url + "\n")
 
 
 def load_sent_news() -> set[str]:
-    """Load previously sent news URLs from disk."""
+    """Load previously sent news URLs from remote S3 or local disk."""
+    remote = fetch_s3_set(S3_SENT_NEWS_KEY) if S3_CLIENT else None
+    if remote is not None:
+        return remote
     if not os.path.exists(NEWS_SENT_FILE):
         return set()
     with open(NEWS_SENT_FILE, encoding="utf-8") as file:
@@ -92,7 +186,7 @@ def load_sent_news() -> set[str]:
 
 
 def persist_sent_news(url: str) -> None:
-    """Append a sent news URL to disk."""
+    """Append a sent news URL to local disk."""
     with open(NEWS_SENT_FILE, "a", encoding="utf-8") as file:
         file.write(url + "\n")
 
@@ -106,12 +200,12 @@ def load_sitemap_sources() -> list[str]:
             lines = response.text.splitlines()
             return [line.strip() for line in lines if line.strip()]
         except Exception as err:
-            print(f"{datetime.now().isoformat(timespec='seconds')} Sitemap listesi uzaktan alınamadı ({SITEMAP_LIST_URL}): {err}")
+            print(f"{datetime.now().isoformat(timespec='seconds')} Sitemap list fetch failed ({SITEMAP_LIST_URL}): {err}")
             return []
 
     if not os.path.exists(SITEMAP_LIST_FILE):
         print(
-            f"{datetime.now().isoformat(timespec='seconds')} Uyarı: {SITEMAP_LIST_FILE} bulunamadı ve SITEMAP_LIST_URL tanımlı değil."
+            f"{datetime.now().isoformat(timespec='seconds')} Warning: {SITEMAP_LIST_FILE} not found and SITEMAP_LIST_URL not set."
         )
         return []
     with open(SITEMAP_LIST_FILE, encoding="utf-8") as file:
@@ -125,7 +219,7 @@ def fetch_sitemap_urls(sitemap_url: str) -> list[str]:
     try:
         tree = ElementTree.fromstring(response.content)
     except ElementTree.ParseError as err:
-        print(f"{datetime.now().isoformat(timespec='seconds')} Sitemap parse hatası ({sitemap_url}): {err}")
+        print(f"{datetime.now().isoformat(timespec='seconds')} Sitemap parse error ({sitemap_url}): {err}")
         return []
 
     urls = []
@@ -135,7 +229,7 @@ def fetch_sitemap_urls(sitemap_url: str) -> list[str]:
     return urls
 
 
-def build_fallback_url(tweet_id: str | None) -> str:
+def build_fallback_url(tweet_id: Optional[str]) -> str:
     """Construct a fallback URL if API response lacks one."""
     if not tweet_id:
         return ""
@@ -153,7 +247,7 @@ def send_telegram_message(text: str) -> bool:
         response.raise_for_status()
         return True
     except Exception as err:
-        print(f"{datetime.now().isoformat(timespec='seconds')} Telegram gönderim hatası: {err}")
+        print(f"{datetime.now().isoformat(timespec='seconds')} Telegram send error: {err}")
         return False
 
 
@@ -175,6 +269,10 @@ def main() -> None:
     print(
         f"{datetime.now().isoformat(timespec='seconds')} -> Sitemaps kaynağı ({SITEMAP_LIST_URL or SITEMAP_LIST_FILE}) {SITEMAP_CHECK_SECONDS} saniyede bir; listeyi {SITEMAP_REFRESH_SECONDS} saniyede bir yenile."
     )
+    if S3_CLIENT:
+        print(
+            f"{datetime.now().isoformat(timespec='seconds')} -> S3 dedup aktif: bucket={S3_BUCKET}, urls_key={S3_SENT_URLS_KEY}, news_key={S3_SENT_NEWS_KEY}"
+        )
 
     while True:
         now = time.time()
@@ -233,6 +331,7 @@ def main() -> None:
                         if sent and url:
                             sent_urls.add(url)
                             persist_sent_url(url)
+                            upload_s3_set(sent_urls, S3_SENT_URLS_KEY)
                 else:
                     print(f"{datetime.now().isoformat(timespec='seconds')} Yeni tweet eşleşmesi yok.")
 
@@ -269,6 +368,7 @@ def main() -> None:
                         if sent:
                             sent_news.add(link)
                             persist_sent_news(link)
+                            upload_s3_set(sent_news, S3_SENT_NEWS_KEY)
                 else:
                     print(f"{datetime.now().isoformat(timespec='seconds')} Yeni haber yok ({sitemap_url}).")
 
@@ -285,4 +385,5 @@ def main() -> None:
 
 if __name__ == "__main__":
     SESSION = create_session()
+    S3_CLIENT = create_s3_client()
     main()
